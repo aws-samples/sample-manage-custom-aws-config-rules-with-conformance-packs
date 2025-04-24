@@ -9,6 +9,10 @@ This project provides a solution for managing custom AWS Config rules and automa
 - **Cross-Account Access**: Supports cross-account compliance checks using IAM roles.
 - **CloudFormation Templates**: Includes templates for deploying resources in both management and member accounts.
 
+## Solutions Architecture
+
+![alt text](image.png)
+
 ## Folder Structure
 
 - **`AutomationSecurityGroupConformanceLambdaFunction.py`**: Lambda function for remediating non-compliant security group rules.
