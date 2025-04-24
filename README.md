@@ -11,7 +11,7 @@ This project provides a solution for managing custom AWS Config rules and automa
 
 ## Solutions Architecture
 
-![alt text](image.png)
+![alt text](<architecture.png>)
 
 ## Folder Structure
 
