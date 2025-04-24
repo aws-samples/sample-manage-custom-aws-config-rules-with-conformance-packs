@@ -1,0 +1,49 @@
+#  Conformance Pack with Remediations - EC2 Security Group Rule
+Resources:        
+  SecurityGroupCIDRSizeCheckConfigRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: SecurityGroupCIDRSizeCheckConfigRuleall
+      Description: Checks if security group rules allow access for a CIDR block larger than /16
+      Scope:
+        ComplianceResourceTypes: 
+        - AWS::EC2::SecurityGroup
+      Source:
+        Owner: CUSTOM_LAMBDA   
+        SourceDetails: 
+          - 
+            EventSource: "aws.config"
+            MessageType: "ConfigurationItemChangeNotification" 
+        SourceIdentifier: !Sub arn:aws:lambda:us-east-1:<Account-Id>:function:ConformancePackSecurityGroupFunction
+      InputParameters: {}
+
+  SecurityGroupCIDRSizeCheckConfigRuleRemediation:
+    Type: "AWS::Config::RemediationConfiguration"
+    DependsOn: "SecurityGroupCIDRSizeCheckConfigRule"
+    Properties:
+      TargetVersion: "1"
+      ExecutionControls:
+        SsmControls:
+          ErrorPercentage: 10
+          ConcurrentExecutionRatePercentage: 10
+      Parameters:
+        AutomationAssumeRole:
+          StaticValue:
+            Values: 
+              - arn:aws:iam::<Account-Id>:role/member-acc-role
+        SecurityGroup:
+          ResourceValue:
+            Value: "RESOURCE_ID"
+        MasterAccountID:
+          StaticValue:
+            Values: 
+              - <Account-Id>
+      TargetType: "SSM_DOCUMENT"
+      ConfigRuleName: SecurityGroupCIDRSizeCheckConfigRuleall
+      ResourceType: "AWS::EC2::SecurityGroup"
+      RetryAttemptSeconds: 600
+      MaximumAutomaticAttempts: 10
+      TargetId: "arn:aws:ssm:us-east-1:<Account-Id>:document/SecurityGroupAutomationSSMDocument"
+      Automatic: false
+
+

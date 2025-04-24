@@ -1,0 +1,122 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  This template deploys an IAM role in member accounts that allows the management account 
+  to perform automated security group compliance checks and remediation.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Management Account Configuration"
+        Parameters:
+          - ManagementAccountID
+    ParameterLabels:
+      ManagementAccountID:
+        default: "Management Account ID"
+
+Parameters:
+  ManagementAccountID:
+    Type: String
+    Description: AWS Account ID of the management account
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a valid 12-digit AWS account ID
+    MinLength: 12
+    MaxLength: 12
+
+Resources:
+  AutomationAssumeRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Role name needs to be consistent across member accounts for automation
+    Properties:
+      RoleName: 'member-acc-role'
+      Description: !Sub 'Role used by management account ${ManagementAccountID} for security group compliance automation'
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${ManagementAccountID}:root'
+            Action: sts:AssumeRole
+      Path: /
+      Tags:
+        - Key: Purpose
+          Value: SecurityGroupCompliance
+        - Key: CreatedBy
+          Value: CloudFormation
+        - Key: StackName
+          Value: !Ref AWS::StackName
+        - Key: LastModified
+          Value: !Ref AWS::StackName
+      Policies:
+        - PolicyName: MemberAccountPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ConfigPermissions
+                Effect: Allow
+                Action:
+                  - config:PutEvaluations
+                  - config:GetResourceConfigHistory
+                Resource: 
+                  - !Sub 'arn:aws:config:${AWS::Region}:${AWS::AccountId}:config-rule/*'
+                  - !Sub 'arn:aws:config:${AWS::Region}:${AWS::AccountId}:*'
+                Condition:
+                  StringEquals:
+                    'aws:PrincipalAccount': !Ref ManagementAccountID
+              
+              - Sid: EC2Permissions
+                Effect: Allow
+                Action:
+                  - ec2:DescribeSecurityGroups
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:UpdateSecurityGroupRuleDescriptionsIngress
+                Resource: !Sub 'arn:aws:ec2:*:${AWS::AccountId}:security-group/*'
+                Condition:
+                  StringEquals:
+                    'aws:PrincipalAccount': !Ref ManagementAccountID
+              
+              - Sid: LoggingPermissions
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/automation/*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/automation/*:log-stream:*'
+                Condition:
+                  StringEquals:
+                    'aws:PrincipalAccount': !Ref ManagementAccountID
+
+Outputs:
+  AutomationRoleArn:
+    Description: ARN of the created automation role
+    Value: !GetAtt AutomationAssumeRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AutomationRoleArn'
+
+  AutomationRoleName:
+    Description: Name of the created automation role
+    Value: !Ref AutomationAssumeRole
+    Export:
+      Name: !Sub '${AWS::StackName}-AutomationRoleName'
+
+Rules:
+  ValidateAccountID:
+    RuleCondition: !Not [!Equals [!Ref ManagementAccountID, !Ref 'AWS::AccountId']]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref ManagementAccountID, '']]
+        AssertDescription: Management Account ID cannot be empty
+      - Assert: !Not [!Equals [!Ref ManagementAccountID, !Ref 'AWS::AccountId']]
+        AssertDescription: Management Account ID must be different from the member account ID
+      - Assert: !Not [!Equals [!Ref ManagementAccountID, '000000000000']]
+        AssertDescription: Management Account ID cannot be zeros
+
+
+
+

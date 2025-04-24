@@ -1,0 +1,426 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  This template deploys a conformance pack with custom config rules to monitor and remediate security group configurations.
+  It includes Lambda functions for evaluation and remediation, along with required IAM roles and SSM automation.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Configuration Parameters"
+        Parameters:
+          - ManagementAccountId
+
+Parameters:
+  ManagementAccountId:
+    Type: String
+    Description: AWS Account ID of the management account
+
+Resources:
+  ###########################################
+  # Lambda Functions
+  ###########################################
+  ConformancePackSecurityGroupLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ConformancePackSecurityGroupFunction
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Role: !GetAtt ConformancePackSecurityGroupLambdaRole.Arn
+      ReservedConcurrentExecutions: 10
+      Timeout: 15
+      Environment:
+        Variables:
+          ManagementAccountId: !Ref ManagementAccountId
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              """
+              Main handler for the Lambda function.
+              Evaluates security group compliance based on CIDR rules.
+              """
+              logger.info(f'Received event: {json.dumps(event)}')
+
+              try:
+                  # Extract resource details from the event
+                  invoking_event = json.loads(event['invokingEvent'])
+                  config_item = invoking_event['configurationItem']
+                  
+                  resource_type = config_item['resourceType']
+                  resource_id = config_item['resourceId']
+                  resource_name = config_item['resourceName']
+                  ip_permissions = config_item['configuration']['ipPermissions']
+                  account_id = config_item['configuration']['ownerId']
+
+                  logger.info(f'Evaluating resource: {resource_id} ({resource_name})')
+
+                  # Get temporary credentials for the member account
+                  ak, sk, st = get_temp_credentials(account_id)
+
+                  # Initialize AWS Config client
+                  config_client = boto3.client('config',
+                                              aws_access_key_id=ak,
+                                              aws_secret_access_key=sk,
+                                              aws_session_token=st)
+
+                  # Determine compliance status
+                  if resource_type == 'AWS::EC2::SecurityGroup' and has_compliant_cidr_rule(resource_id, ip_permissions):
+                      compliance_type = 'COMPLIANT'
+                  else:
+                      compliance_type = 'NON_COMPLIANT'
+
+                  # Put evaluation results
+                  put_evaluation_results(config_client, resource_type, resource_id, resource_name, 
+                                        compliance_type, invoking_event['notificationCreationTime'], 
+                                        event['resultToken'])
+
+              except Exception as e:
+                  logger.error(f'Error occurred: {str(e)}')
+                  raise
+
+          def has_compliant_cidr_rule(security_group_id, ip_permissions):
+              """
+              Check if the security group has compliant CIDR rules.
+              """
+              if not ip_permissions:
+                  return True
+
+              for rule in ip_permissions:
+                  user_id_group_pairs = rule.get('userIdGroupPairs', [])
+                  logger.debug(f'Checking rule for security group: {security_group_id}')
+                  logger.debug(f'IP Permissions: {ip_permissions}, User ID Group Pairs: {user_id_group_pairs}')
+
+                  if not user_id_group_pairs:
+                      for ip_range in rule.get('ipRanges', []):
+                          cidr_block = ip_range['cidrIp']
+                          if '/' in cidr_block:
+                              prefix_len = int(cidr_block.split('/')[1])
+                              if prefix_len == 0 or prefix_len >= 16:
+                                  return True
+                              else:
+                                  return False
+                  else:
+                      return True
+
+              return False
+
+          def get_temp_credentials(account_id):
+              """
+              Get temporary credentials for the specified account.
+              """
+              sts_connection = boto3.client('sts')
+              role_arn = f'arn:aws:iam::{account_id}:role/member-acc-role'
+              assumed_role = sts_connection.assume_role(
+                  RoleArn=role_arn,
+                  RoleSessionName="cross_acct_lambda"
+              )
+              credentials = assumed_role['Credentials']
+              
+              return (credentials['AccessKeyId'], 
+                      credentials['SecretAccessKey'], 
+                      credentials['SessionToken'])
+
+          def put_evaluation_results(config_client, resource_type, resource_id, resource_name, 
+                                    compliance_type, notification_creation_time, result_token):
+              """
+              Put evaluation results for the Config rule.
+              """
+              config_client.put_evaluations(
+                  Evaluations=[
+                      {
+                          'ComplianceResourceType': resource_type,
+                          'ComplianceResourceId': resource_id,
+                          'ComplianceType': compliance_type,
+                          'Annotation': f'This resource is {compliance_type}. Security Group name: {resource_name}',
+                          'OrderingTimestamp': notification_creation_time
+                      },
+                  ],
+                  ResultToken=result_token
+              )
+              logger.info(f'Evaluation result sent: {compliance_type} for {resource_id}')
+            
+  AutomationSecurityGroupConformanceLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AutomationSecurityGroupConformanceFunction
+      Runtime: python3.8
+      Handler: index.script_handler
+      Role: !GetAtt AutomationSecurityGroupConformanceLambdaRole.Arn
+      ReservedConcurrentExecutions: 10
+      Timeout: 15
+      Environment:
+        Variables:
+          ManagementAccountId: !Ref ManagementAccountId
+      Code:
+        ZipFile: |
+          """
+          AWS Lambda function for managing security group rules compliance.
+          This module handles the evaluation and remediation of non-compliant security group rules.
+          """
+          import boto3
+          import logging
+          from botocore.exceptions import ClientError
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def get_temporary_credentials(account_id):
+              """Get temporary credentials for cross-account access."""
+              try:
+                  sts_client = boto3.client('sts')
+                  role_arn = f'arn:aws:iam::{account_id}:role/member-acc-role'
+                  response = sts_client.assume_role(
+                      RoleArn=role_arn,
+                      RoleSessionName="cross_acct_lambda",
+                      DurationSeconds=900  # 15 minutes
+                  )
+                  return response['Credentials']
+              except ClientError as e:
+                  logger.warning(f"Failed to assume role: {str(e)}")
+                  raise
+
+          def get_ec2_client(credentials):
+              """Initialize EC2 client with temporary credentials."""
+              return boto3.client(
+                  'ec2',
+                  aws_access_key_id=credentials['AccessKeyId'],
+                  aws_secret_access_key=credentials['SecretAccessKey'],
+                  aws_session_token=credentials['SessionToken']
+              )
+
+          def get_security_group_rules(ec2_client, security_group_id):
+              """Retrieve security group rules."""
+              try:
+                  response = ec2_client.describe_security_groups(GroupIds=[security_group_id])
+                  return response['SecurityGroups'][0].get('IpPermissions', [])
+              except ClientError as e:
+                  logger.warning(f"Failed to describe security group {security_group_id}: {str(e)}")
+                  raise
+
+          def is_rule_compliant(cidr_block):
+              """
+              Check if CIDR block complies with security requirements.
+              Valid CIDR blocks should have prefix length of 0 or >= 16
+              """
+              try:
+                  prefix_len = int(cidr_block.split('/')[1])
+                  return prefix_len >= 16
+              except ValueError:
+                  logger.error(f"Invalid CIDR block format: {cidr_block}")
+                  return False
+
+
+          def revoke_non_compliant_rules(ec2_client, security_group_id, rules):
+              """Revoke non-compliant security group rules."""
+              rules_revoked = 0
+              for rule in rules:
+                  if not rule.get('UserIdGroupPairs'):
+                      for ip_range in rule.get('IpRanges', []):
+                          cidr_block = ip_range['CidrIp']
+                          if not is_rule_compliant(cidr_block):
+                              try:
+                                  ec2_client.revoke_security_group_ingress(
+                                      GroupId=security_group_id,
+                                      IpPermissions=[rule]
+                                  )
+                                  rules_revoked += 1
+                                  logger.info(f"Revoked non-compliant rule: {cidr_block}")
+                              except ClientError as e:
+                                  logger.error(f"Failed to revoke rule: {str(e)}")
+              return rules_revoked
+
+          def lambda_handler(event, context):
+              """Main Lambda handler function."""
+              try:
+                  logger.info(f"Processing event: {event}")
+
+                  # Extract required parameters
+                  security_group_id = event.get('parameterValue')
+                  account_id = event.get('accountID')
+
+                  # Validate input parameters
+                  if not all([security_group_id, account_id]):
+                      raise ValueError("Missing required parameters")
+
+                  # Get temporary credentials and initialize EC2 client
+                  credentials = get_temporary_credentials(account_id)
+                  ec2_client = get_ec2_client(credentials)
+
+                  # Get security group rules
+                  rules = get_security_group_rules(ec2_client, security_group_id)
+
+                  # Revoke non-compliant rules
+                  rules_revoked = revoke_non_compliant_rules(ec2_client, security_group_id, rules)
+
+                  # Return success response
+                  return {
+                      'statusCode': 200,
+                      'body': {
+                          'message': 'Successfully processed security group rules',
+                          'securityGroupId': security_group_id,
+                          'rulesProcessed': len(rules),
+                          'rulesRevoked': rules_revoked
+                      }
+                  }
+
+              except ValueError as e:
+                  # Handle validation errors
+                  logger.error(f"Validation error: {str(e)}")
+                  return {'statusCode': 400, 'body': {'error': str(e)}}
+              except ClientError as e:
+                  # Handle AWS API errors
+                  logger.error(f"AWS API error: {str(e)}")
+                  return {'statusCode': 500, 'body': {'error': str(e)}}
+              except Exception as e:
+                  # Handle unexpected errors
+                  logger.error(f"Unexpected error: {str(e)}")
+                  return {'statusCode': 500, 'body': {'error': 'Internal server error'}}
+
+
+  ###########################################
+  # IAM Roles
+  ###########################################
+
+  ConformancePackSecurityGroupLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ConformancePackSecurityGroupLambdaRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ConformancePackSecurityGroupLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: VisualEditor0
+                Effect: Allow
+                Action: sts:AssumeRole
+                Resource: 'arn:aws:iam::*:role/member-acc-role'
+              - Sid: VisualEditor1
+                Effect: Allow
+                Action: config:PutEvaluations
+                Resource: '*'
+
+
+  AutomationSecurityGroupConformanceLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AutomationSecurityGroupConformanceLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AutomationSecurityGroupConformanceLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: VisualEditor0
+                Effect: Allow
+                Action: ec2:RevokeSecurityGroupIngress
+                Resource: 'arn:aws:ec2:*:*:security-group/*'
+              - Sid: VisualEditor1
+                Effect: Allow
+                Action: ec2:DescribeSecurityGroups
+                Resource: '*'
+              - Sid: VisualEditor2
+                Effect: Allow
+                Action: sts:AssumeRole
+                Resource: 'arn:aws:iam::*:role/member-acc-role'
+
+  RemoveSecurityGroupRuleSSMDocRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'SSMDocumentRole-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: SSMDocumentPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ssm:StartAutomationExecution
+                Resource: !Sub arn:aws:ssm:*:${AWS::AccountId}:automation-definition/*
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt AutomationSecurityGroupConformanceLambdaFunction.Arn
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt AutomationSecurityGroupConformanceLambdaRole.Arn
+
+  ###########################################
+  # SSM Automation Document
+  ###########################################
+  RemoveSecurityGroupRuleSSMDoc:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Name: SecurityGroupAutomationSSMDocument
+      Content:
+        description: Automation Document for Security Group Rule Remediation
+        schemaVersion: '0.3'
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          SecurityGroup:
+            type: String
+            description: Security Group ID to remediate
+          AutomationAssumeRole:
+            type: String
+            description: The ARN of the role
+            default: !GetAtt RemoveSecurityGroupRuleSSMDocRole.Arn
+          ManagementAccountId:
+            type: String
+            description: The Management Account ID
+            default: !Ref ManagementAccountId
+        mainSteps:
+          - name: invokeMyLambdaFunction
+            action: 'aws:invokeLambdaFunction'
+            maxAttempts: 3
+            timeoutSeconds: 120
+            onFailure: Abort
+            inputs:
+              FunctionName: !GetAtt AutomationSecurityGroupConformanceLambdaFunction.Arn
+              Payload: '{"parameterName":"SecurityGroup", "parameterValue":"{{SecurityGroup}}", "accountID":"{{global:ACCOUNT_ID}}"}'
+
+Outputs:
+  ConformancePackLambdaArn:
+    Description: ARN of the Conformance Pack Lambda Function
+    Value: !GetAtt ConformancePackSecurityGroupLambdaFunction.Arn
+
+  AutomationLambdaArn:
+    Description: ARN of the Automation Lambda Function
+    Value: !GetAtt AutomationSecurityGroupConformanceLambdaFunction.Arn
+
+  SSMDocumentName:
+    Description: Name of the created SSM Document
+    Value: !Ref RemoveSecurityGroupRuleSSMDoc
